@@ -1,0 +1,67 @@
+trigger:
+  branches:
+    include:
+      - '*'
+  paths:
+    exclude:
+      - README.md
+      - .gitignore
+      - dev.config
+
+variables:
+  terraformVersion: 1.8.2
+  isHotfixBranch: $[startsWith(variables['Build.SourceBranch'], 'refs/heads/hotfix/')]
+  isMainBranch: $[eq(variables['Build.SourceBranchName'], 'main')]
+  isReleaseBranch: $[or(eq(variables.isHotfixBranch, true), eq(variables.isMainBranch, true))]
+
+resources:
+  - repo: self
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+  - stage: Build
+    jobs:
+      - job: validateTerraform
+        steps:
+          - task: TerraformInstaller@1
+            displayName: 'Install Terraform'
+            inputs:
+              terraformVersion: $(terraformVersion)
+          - task: TerraformCLI@1
+            displayName: 'Initialize Terraform'
+            inputs:
+              command: init
+              backendType: azurerm
+              backendServiceArm: DEV_SC
+              backendAzureRmResourceGroupName: 'terraform-dev'
+              backendAzureRmStorageAccountName: 'pizzastatedev'
+              backendAzureRmContainerName: 'tfstate'
+              backendAzureRmKey: 'dev.tfstate'
+          - task: TerraformCLI@1
+            displayName: 'Validate Infrastructure (Terraform)'
+            inputs:
+              provider: 'azurerm'
+              command: 'validate'
+              workingDirectory: '$(System.DefaultWorkingDirectory)'
+          - task: trivy@1
+            inputs:
+              path: .
+
+  - template: /pipelines/template/deployment_steps.yaml
+    parameters:
+      envName: 'dev'
+      serviceConnection: DEV_SC
+      executeStage: and(succeeded(), eq(variables.isReleaseBranch, true), eq(variables.isHotfixBranch, false))
+      dependsOn:
+        - Build
+
+  - template: /pipelines/template/deployment_steps.yaml
+    parameters:
+      envName: 'prod'
+      serviceConnection: PROD_SC
+      executeStage: and(succeeded(), or(eq(variables.isReleaseBranch, true), eq(variables.isHotfixBranch, true)))
+      dependsOn:
+        - Build
+        - DEV

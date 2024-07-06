@@ -1,0 +1,105 @@
+parameters:
+  - name: envName
+    default: ''
+  - name: appName
+    default: 'PizzaInfra'
+  - name: serviceConnection
+    default: ''
+  - name: executeStage
+  - name: dependsOn
+    type: object
+    default: { }
+
+stages:
+  - stage: ${{ upper(parameters.envName) }}
+    displayName: Deploy to ${{ upper(parameters.envName) }} environment
+    condition: eq(${{ parameters.executeStage }}, 'True')
+    dependsOn: ${{ parameters.dependsOn }}
+    jobs:
+      - job: plan
+        steps:
+          - task: TerraformInstaller@1
+            displayName: Install Terraform
+            inputs:
+              terraformVersion: $(terraformVersion)
+          - task: TerraformCLI@1
+            displayName: 'Initialize Terraform'
+            inputs:
+              command: init
+              backendType: azurerm
+              backendServiceArm: ${{ parameters.serviceConnection }}
+              backendAzureRmResourceGroupName: 'terraform-${{ parameters.envName }}'
+              backendAzureRmStorageAccountName: 'pizzastate${{ parameters.envName }}'
+              backendAzureRmContainerName: 'tfstate'
+              backendAzureRmKey: '${{ parameters.envName }}.tfstate'
+          - task: TerraformCLI@1
+            displayName: 'Plan Terraform'
+            inputs:
+              provider: 'azurerm'
+              command: 'plan'
+              commandOptions: '-var-file=tfvars/${{ parameters.envName }}.json -out tfplan -no-color'
+              environmentServiceName: ${{ parameters.serviceConnection }}
+          - publish: tfplan
+            displayName: 'Publish plan'
+            artifact: tfplan-${{ parameters.envName }}
+
+      - job: waitForValidation
+        dependsOn: plan
+        displayName: Wait for external validation
+        pool: server
+        timeoutInMinutes: 4320 # job times out in 3 days
+        steps:
+          - task: ManualValidation@0
+            timeoutInMinutes: 1440 # task times out in 1 day
+            inputs:
+              instructions: 'Please validate the output from the plan step'
+              onTimeout: 'reject'
+
+      - deployment: apply
+        displayName: Apply Terraform
+        environment: ${{ upper(parameters.envName) }}
+        dependsOn: waitForValidation
+        pool:
+          vmImage: 'ubuntu-latest'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - task: TerraformInstaller@1
+                  displayName: 'Install Terraform'
+                  inputs:
+                    terraformVersion: $(terraformVersion)
+                - task: TerraformCLI@1
+                  displayName: 'Initialize Terraform'
+                  inputs:
+                    command: init
+                    backendType: azurerm
+                    backendServiceArm: ${{ parameters.serviceConnection }}
+                    backendAzureRmResourceGroupName: 'terraform-${{ parameters.envName }}'
+                    backendAzureRmStorageAccountName: 'pizzastate${{ parameters.envName }}'
+                    backendAzureRmContainerName: 'tfstate'
+                    backendAzureRmKey: '${{ parameters.envName }}.tfstate'
+                - task: DownloadPipelineArtifact@2
+                  displayName: 'Download tfplan'
+                  inputs:
+                    artifact: tfplan-${{parameters.envName}}
+                    path: '$(Build.SourcesDirectory)'
+                - task: TerraformCLI@1
+                  displayName: 'Apply Terraform'
+                  inputs:
+                    command: apply
+                    commandOptions: '$(Pipeline.Workspace)/tfplan-${{ parameters.envName }}/tfplan'
+                    environmentServiceName: ${{ parameters.serviceConnection }}
+
+      - ${{ if eq(parameters.envName, 'prod') }}:
+          - job: tag
+            dependsOn: apply
+            steps:
+              - checkout: self
+                persistCredentials: true
+
+              - script: |
+                  git tag -f ${{ upper(parameters.appName) }}_PRODUCTION
+                  git push -f origin ${{ upper(parameters.appName) }}_PRODUCTION
+                workingDirectory: $(Build.SourcesDirectory)
